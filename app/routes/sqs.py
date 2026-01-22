@@ -1,5 +1,5 @@
 """Blueprint Flask para exposição de endpoints de interação com filas SQS."""
-
+import json
 from functools import wraps
 from typing import Any, Dict, List, Optional
 
@@ -35,6 +35,18 @@ def with_sqs_client(func):
 
     return wrapper
 
+
+def normalize_attributes(attrs):
+    if not attrs:
+        return None
+    result = {}
+    for k, v in attrs.items():
+        if isinstance(v, dict) and "DataType" in v and ("StringValue" in v or "BinaryValue" in v):
+            result[k] = v
+        else:
+            # Assume string se vier simples
+            result[k] = {"DataType": "String", "StringValue": str(v)}
+    return result
 
 # ----------------------------------------------------------------------
 # Endpoint: enviar mensagem para a fila (por nome)
@@ -89,8 +101,14 @@ def send_message(sqs, queue_name: str):
                 400,
             )
 
+        if not isinstance(message, str):
+            try:
+                message = json.dumps(message)
+            except Exception as e:
+                return jsonify({"error": f"Failed to serialize message: {e}"}), 400
+
         delay_seconds: Optional[int] = data.get("delay_seconds")
-        attributes: Optional[Dict[str, Any]] = data.get("attributes")
+        attributes: Optional[Dict[str, Any]] = normalize_attributes(data.get("attributes"))
 
         queue_url = get_queue_url_by_name(sqs, queue_name)
 
@@ -307,6 +325,79 @@ def purge_queue(sqs, queue_name: str):
                 }
             ),
             200,
+        )
+    except ClientError as e:
+        return client_error_response(e)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ----------------------------------------------------------------------
+# Endpoint: criar fila SQS
+# ----------------------------------------------------------------------
+@sqs_bp.route("/v1/sqs/queues", methods=["POST"])
+@with_sqs_client
+def create_queue(sqs):
+    """
+    Cria uma fila SQS.
+
+    Corpo da requisição (JSON)
+    --------------------------
+    queue_name : str (obrigatório)
+        Nome da fila SQS a ser criada.
+    attributes : dict[str, str] (opcional)
+        Mapa de atributos da fila aceitos pelo SQS, por exemplo:
+        {
+            "VisibilityTimeout": "30",
+            "MessageRetentionPeriod": "86400",
+            "ReceiveMessageWaitTimeSeconds": "20"
+        }
+
+    Returns
+    -------
+    201 Created
+        JSON com `queue_name`, `queue_url` e `queue_arn`.
+    400 Bad Request
+        Se o corpo for inválido ou faltar `queue_name`.
+    500 Internal Server Error
+        Em caso de erro ao acessar o SQS.
+    """
+    try:
+        data = request.get_json(silent=True)
+        if data is None:
+            return jsonify({"error": "Invalid or missing JSON body"}), 400
+
+        queue_name: Optional[str] = data.get("queue_name")
+        if not queue_name:
+            return (
+                jsonify({"error": "Missing required field in body: queue_name"}),
+                400,
+            )
+
+        attributes: Dict[str, str] = data.get("attributes") or {}
+
+        # Cria a fila
+        resp = sqs.create_queue(
+            QueueName=queue_name,
+            Attributes=attributes,
+        )
+        queue_url = resp.get("QueueUrl")
+
+        # Busca o ARN da fila recém-criada
+        attrs_resp = sqs.get_queue_attributes(
+            QueueUrl=queue_url,
+            AttributeNames=["QueueArn"],
+        )
+        queue_arn = attrs_resp.get("Attributes", {}).get("QueueArn")
+
+        return (
+            jsonify(
+                {
+                    "queue_name": queue_name,
+                    "queue_url": queue_url,
+                    "queue_arn": queue_arn,
+                }
+            ),
+            201,
         )
     except ClientError as e:
         return client_error_response(e)

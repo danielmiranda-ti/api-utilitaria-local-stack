@@ -158,6 +158,141 @@ GET /v1/dynamodb/item
 
 ---
 
+#### 3. Criar tabela DynamoDB
+
+```http
+POST /v1/dynamodb/tables
+```
+
+**Body (JSON)**
+
+- `table_name` (obrigatório): nome da tabela a ser criada.  
+- `partition_key_name` (obrigatório): nome do atributo de chave de partição (HASH).  
+- `partition_key_type` (obrigatório): tipo do atributo de chave de partição:
+  - `"S"` – String  
+  - `"N"` – Number  
+  - `"B"` – Binary  
+
+- `sort_key_name` (opcional): nome do atributo de chave de ordenação (RANGE).  
+- `sort_key_type` (opcional): tipo do atributo de chave de ordenação (`"S"`, `"N"`, `"B"`).  
+  > Obrigatório se `sort_key_name` for informado.
+
+- `billing_mode` (opcional, padrão: `"PAY_PER_REQUEST"`): modo de cobrança da tabela:
+  - `"PAY_PER_REQUEST"` – on-demand (sem provisionar capacidade)
+  - `"PROVISIONED"` – capacidade provisionada
+
+- `read_capacity_units` (opcional, padrão: `5`): capacidade de leitura, usado apenas se `billing_mode = "PROVISIONED"`.  
+- `write_capacity_units` (opcional, padrão: `5`): capacidade de escrita, usado apenas se `billing_mode = "PROVISIONED"`.
+
+**Comportamento**
+
+- Monta a definição de chave com:
+  - chave de partição (sempre obrigatória)
+  - sort key opcional (se informada)
+- Usa `dynamodb.create_table(...)` com:
+  - `TableName`
+  - `AttributeDefinitions`
+  - `KeySchema`
+  - `BillingMode`
+  - `ProvisionedThroughput` (apenas se `billing_mode = "PROVISIONED"`)
+- Em LocalStack a tabela normalmente fica disponível imediatamente; em AWS real o status inicial pode ser `"CREATING"`.
+
+**Exemplo – tabela só com chave de partição**
+
+```bash
+curl -X POST "http://localhost:8000/v1/dynamodb/tables" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "table_name": "MinhaTabela",
+        "partition_key_name": "id",
+        "partition_key_type": "S"
+      }'
+```
+
+**Exemplo – tabela com partição + sort key, modo PROVISIONED**
+
+```bash
+curl -X POST "http://localhost:8000/v1/dynamodb/tables" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "table_name": "Pedidos",
+        "partition_key_name": "cliente_id",
+        "partition_key_type": "S",
+        "sort_key_name": "pedido_id",
+        "sort_key_type": "S",
+        "billing_mode": "PROVISIONED",
+        "read_capacity_units": 5,
+        "write_capacity_units": 5
+      }'
+```
+
+**Resposta (exemplo)**
+
+```json
+{
+  "table_name": "Pedidos",
+  "table_status": "ACTIVE",
+  "table_arn": "arn:aws:dynamodb:us-east-1:000000000000:table/Pedidos",
+  "billing_mode": "PROVISIONED"
+}
+```
+---
+
+#### 4. Criar ou atualizar item em uma tabela DynamoDB
+
+```http
+POST /v1/dynamodb/item?table_name=<nome_da_tabela>
+```
+
+**Query params**
+
+- `table_name` (obrigatório): nome da tabela DynamoDB.
+
+**Body (JSON)**
+
+- `item` (obrigatório): objeto JSON representando o item completo a ser salvo na tabela.  
+  > As chaves definidas no schema da tabela (partition key e sort key, se houver) devem estar presentes neste objeto.
+
+**Comportamento**
+
+- Realiza a operação `put_item` na tabela DynamoDB informada.
+- Se o item já existir (mesma chave primária), ele será substituído.
+- Se não existir, será criado.
+- Valida se o campo `item` está presente e é um objeto.
+
+**Exemplo**
+
+```bash
+curl -X POST "http://localhost:8000/v1/dynamodb/item?table_name=MinhaTabela" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "item": {
+          "id": "1",
+          "name": "Item 1"
+        }
+      }'
+```
+
+**Resposta (exemplo)**
+
+```json
+{
+  "table_name": "MinhaTabela",
+  "item": {
+    "id": "1",
+    "name": "Item 1"
+  }
+}
+```
+
+**Códigos de resposta**
+
+- `201 Created`: Item salvo com sucesso.
+- `400 Bad Request`: Corpo ausente ou inválido, campo `item` ausente ou com tipo inválido.
+- `500 Internal Server Error`: Erro ao acessar o DynamoDB.
+
+---
+
 ### 📮 SQS
 
 #### 1. Enviar mensagem para uma fila (por nome)
@@ -325,6 +460,54 @@ DELETE /v1/sqs/messages/all
   "queue_name": "minha-fila",
   "purged": true,
   "note": "Purge solicitado; operação é assincrona no SQS."
+}
+```
+
+#### 6. Criar fila SQS
+
+```http
+POST /v1/sqs/queues
+```
+
+**Body (JSON)**
+
+- `queue_name` (obrigatório): nome da fila SQS a ser criada.  
+- `attributes` (opcional): mapa de atributos da fila aceitos pelo SQS, por exemplo:
+  - `VisibilityTimeout` (segundos)
+  - `MessageRetentionPeriod` (segundos)
+  - `ReceiveMessageWaitTimeSeconds` (segundos)
+  - `FifoQueue` (`"true"`/`"false"`)
+  - `ContentBasedDeduplication` (`"true"`/`"false"`)
+
+> Todos os valores de `attributes` devem ser **strings**, conforme a API do SQS.
+
+**Comportamento**
+
+- Usa `sqs.create_queue(QueueName=..., Attributes=...)`.  
+- A operação é **idempotente**: se a fila já existir, o SQS retorna a fila existente.  
+- Após criar (ou reutilizar) a fila, o serviço busca o ARN via `get_queue_attributes` e retorna `queue_url` e `queue_arn`.
+
+**Exemplo**
+
+```bash
+curl -X POST "http://localhost:8000/v1/sqs/queues" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "queue_name": "minha-fila",
+        "attributes": {
+          "VisibilityTimeout": "30",
+          "MessageRetentionPeriod": "86400"
+        }
+      }'
+```
+
+**Resposta (exemplo)**
+
+```json
+{
+  "queue_name": "minha-fila",
+  "queue_url": "http://localhost:4566/000000000000/minha-fila",
+  "queue_arn": "arn:aws:sqs:us-east-1:000000000000:minha-fila"
 }
 ```
 
